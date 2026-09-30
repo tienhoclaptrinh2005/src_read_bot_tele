@@ -122,6 +122,13 @@ class CompactConsoleFormatter(logging.Formatter):
             record.stack_info = original_stack_info
 
 
+class ConsoleNoiseFilter(logging.Filter):
+    """Keep Telethon transport chatter in app.log, not in the live console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.name.startswith("telethon")
+
+
 def configure_logging(log_dir: Path, level_name: str, timezone_name: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     level = getattr(logging, level_name.upper(), None)
@@ -144,6 +151,7 @@ def configure_logging(log_dir: Path, level_name: str, timezone_name: str) -> Non
     )
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(console_formatter)
+    console.addFilter(ConsoleNoiseFilter())
     file_handler = logging.handlers.RotatingFileHandler(
         log_dir / "app.log",
         maxBytes=10 * 1024 * 1024,
@@ -152,8 +160,8 @@ def configure_logging(log_dir: Path, level_name: str, timezone_name: str) -> Non
     )
     file_handler.setFormatter(file_formatter)
     logging.basicConfig(level=level, handlers=[console, file_handler], force=True)
-    # Keep the console focused on order backup events. Connection retries and
-    # actual MTProto problems are still shown at WARNING/ERROR level.
+    # Telethon diagnostics remain in logs/app.log. The Wispbyte console only
+    # shows the observer lifecycle and order-backup events.
     logging.getLogger("telethon").setLevel(logging.WARNING)
 
 

@@ -38,12 +38,13 @@ class TelegramOrderListenerTests(unittest.TestCase):
         text: str = SUCCESS_MESSAGE,
         chat_id: int = 123456,
         outgoing: bool = True,
+        message_id: int = 501,
     ) -> None:
         self.listener._handle_message(
             text=text,
             chat_id=chat_id,
             username="buyer",
-            message_id=501,
+            message_id=message_id,
             message_date=datetime(2026, 9, 28, 12, 16, tzinfo=timezone.utc),
             is_outgoing=outgoing,
         )
@@ -101,6 +102,78 @@ walletbuyer@example.com|secret"""
         self.assertEqual(
             product_file.read_text(encoding="utf-8").splitlines(),
             ["walletbuyer@example.com|secret"],
+        )
+
+    @staticmethod
+    def meitu_record(index: int) -> str:
+        return (
+            f"buyer{index}@hotmail.com|pw{index}|"
+            f"Admin123@(Email|Pass Hotmail|Pass Meitu)"
+            f"buyer{index}@hotmail.com|pw{index}|M.C{index}-very-long-token|$|"
+            f"9e5f94bc-e8a4-4e73-b8be-63364c29d75{index}"
+        )
+
+    def test_wallet_x4_split_across_messages_writes_exactly_four_lines(self) -> None:
+        records = tuple(self.meitu_record(index) for index in range(4))
+        self.handle(
+            text="""🧾 Xác nhận đơn hàng
+Sản phẩm: Meitu VIP 7 Ngày BHF
+Số lượng: 4
+Thành tiền: 40k""",
+            message_id=600,
+        )
+        self.handle(
+            text=(
+                "Đã thanh toán qua ví cho đơn hàng ORDER-WALLET-X4 "
+                "(✨ Meitu VIP 7 Ngày BHF). Dưới đây là tài khoản của bạn:"
+            ),
+            message_id=601,
+        )
+        self.assertFalse(
+            (self.storage.data_dir / "Meitu VIP 7 Ngày BHF.txt").exists()
+        )
+
+        # Telegram can divide a long delivery into multiple outgoing messages.
+        # Two accounts arrive first, then the remaining two.
+        self.handle(text="".join(records[:2]), message_id=602)
+        self.assertFalse(
+            (self.storage.data_dir / "Meitu VIP 7 Ngày BHF.txt").exists()
+        )
+        self.handle(text="".join(records[2:]), message_id=603)
+
+        product_file = self.storage.data_dir / "Meitu VIP 7 Ngày BHF.txt"
+        self.assertEqual(
+            product_file.read_text(encoding="utf-8").splitlines(),
+            list(records),
+        )
+        self.assertEqual(
+            len(self.storage.history_file.read_text(encoding="utf-8").splitlines()),
+            4,
+        )
+
+    def test_qr_x4_uses_confirmation_quantity_and_writes_four_lines(self) -> None:
+        records = tuple(self.meitu_record(index) for index in range(4))
+        self.handle(
+            text="""🧾 Xác nhận đơn hàng
+Sản phẩm: Meitu SVip+ 7 Ngày BHF
+Số lượng: 4
+Thành tiền: 40k""",
+            message_id=700,
+        )
+        self.handle(
+            text=(
+                "Đã nhận thanh toán cho đơn hàng ORDER-QR-X4 "
+                "(🚚 Meitu SVip+ 7 Ngày BHF). "
+                "Dưới đây là tài khoản của bạn:\n"
+                + "".join(records)
+            ),
+            message_id=701,
+        )
+
+        product_file = self.storage.data_dir / "Meitu SVip+ 7 Ngày BHF.txt"
+        self.assertEqual(
+            product_file.read_text(encoding="utf-8").splitlines(),
+            list(records),
         )
 
     def test_optional_chat_allowlist_is_enforced(self) -> None:

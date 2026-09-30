@@ -4,7 +4,12 @@ import json
 import unittest
 from datetime import datetime, timezone
 
-from order_parser import OrderParseError, OrderParser
+from order_parser import (
+    IncompleteAccountBatch,
+    OrderParseError,
+    OrderParser,
+    split_account_records,
+)
 
 
 class OrderParserTests(unittest.TestCase):
@@ -120,6 +125,49 @@ wallet03@example.com|pass03""",
         self.assertEqual(order.product, "Canva Pro 1 Tháng")
         self.assertEqual(order.account_count, 3)
         self.assertEqual(order.accounts[2], "wallet03@example.com|pass03")
+
+    def test_confirmation_exposes_product_and_requested_quantity(self) -> None:
+        confirmation = self.parser.parse_confirmation(
+            """🧾 Xác nhận đơn hàng
+Sản phẩm: Meitu VIP 7 Ngày BHF
+Số lượng: 4
+Thành tiền: 40k"""
+        )
+
+        self.assertIsNotNone(confirmation)
+        assert confirmation is not None
+        self.assertEqual(confirmation.product, "Meitu VIP 7 Ngày BHF")
+        self.assertEqual(confirmation.quantity, 4)
+
+    def test_concatenated_meitu_stock_is_split_by_four_uuid_boundaries(self) -> None:
+        records = tuple(
+            (
+                f"buyer{index}@hotmail.com|pw{index}|"
+                f"Admin123@(Email|Pass Hotmail|Pass Meitu)"
+                f"buyer{index}@hotmail.com|pw{index}|M.C{index}-very-long-token|$|"
+                f"9e5f94bc-e8a4-4e73-b8be-63364c29d75{index}"
+            )
+            for index in range(4)
+        )
+
+        self.assertEqual(
+            split_account_records("".join(records), expected_quantity=4),
+            records,
+        )
+
+    def test_incomplete_batch_waits_instead_of_saving_x2_as_x4(self) -> None:
+        partial = "\n".join(
+            (
+                "first@example.com|one",
+                "second@example.com|two",
+            )
+        )
+
+        with self.assertRaises(IncompleteAccountBatch) as context:
+            split_account_records(partial, expected_quantity=4)
+
+        self.assertEqual(context.exception.expected, 4)
+        self.assertEqual(context.exception.found, 2)
 
     def test_labelled_wallet_payment_with_accounts_on_following_lines(self) -> None:
         order = self.parser.parse(

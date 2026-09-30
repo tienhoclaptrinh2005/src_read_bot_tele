@@ -45,10 +45,19 @@ cụm như `Thanh toán qua ví thành công`, `Thanh toán bằng ví thành c�
 phải có mã đơn, tên sản phẩm và phần tài khoản; thông báo ví thất bại/pending/hủy
 sẽ bị bỏ qua.
 
-Một đơn có thể giao 1, 2, 3, 4, 5 hoặc nhiều tài khoản. Mỗi dòng không trống sau
-câu “Dưới đây là tài khoản của bạn” được xem là một tài khoản và được append
-thành một dòng riêng. Toàn bộ các dòng vẫn thuộc cùng một `order_id`, nên Telegram
-gửi lại cùng đơn cũng không làm ghi trùng bất kỳ tài khoản nào.
+Một đơn có thể giao 1, 2, 3, 4, 5 hoặc nhiều tài khoản. Tool ghi nhớ
+`Sản phẩm` và `Số lượng` trong tin **Xác nhận đơn hàng**, sau đó chỉ
+lưu khi đã tách đủ đúng số lượng. Dữ liệu dài được hỗ trợ theo cả ba
+trường hợp:
+
+- Mỗi tài khoản đã nằm trên một dòng.
+- Nhiều tài khoản bị nối liền trong cùng một code block.
+- Telegram chia phần tiêu đề giao hàng và dữ liệu thành nhiều tin nhắn.
+
+Khi chưa nhận đủ, console hiện `⏳ [WAIT ] ... 2/4 tài khoản` và chưa
+ghi file. Khi đủ 4/4, file sản phẩm được append chính xác bốn dòng.
+Toàn bộ các dòng vẫn thuộc cùng một `order_id`, nên Telegram gửi
+lại cùng đơn cũng không làm ghi trùng.
 
 Ví dụ đơn giao ba tài khoản:
 
@@ -116,6 +125,8 @@ Sau một đơn thành công, log sẽ có:
 Console Wispbyte dùng định dạng ngắn vì Wispbyte đã tự thêm thời gian. File
 `logs/app.log` vẫn giữ ngày giờ, mức log, module, người mua, message ID và đường
 dẫn file đầy đủ để kiểm tra chi tiết. Cả hai nơi đều không ghi mật khẩu tài khoản.
+Những cảnh báo kết nối nội bộ của Telethon được giữ trong `logs/app.log`
+nhưng không làm rối console.
 
 ## Cơ chế lưu an toàn
 
@@ -127,6 +138,22 @@ dẫn file đầy đủ để kiểm tra chi tiết. Cả hai nơi đều không
 - Tên sản phẩm Unicode được giữ nguyên; ký tự không hợp lệ trong tên file được
   thay bằng `_`.
 - Log không in token, API hash hoặc mật khẩu tài khoản đã giao.
+- Tool chỉ nghe đơn mới sau khi khởi động; không phát lại toàn bộ backlog cũ.
+
+## Khi gặp `wrong session ID` hoặc `very old message`
+
+Bản này đã tắt chế độ đọc backlog. Nếu `logs/app.log` vẫn lặp lại cảnh
+báo phiên cũ sau khi cập nhật:
+
+1. Bấm **Stop** server Wispbyte và bảo đảm không có bản tool thứ hai đang chạy.
+2. Chỉ xóa file `state/mtproto_bot_<BOT_ID>.session` và file
+   `state/mtproto_bot_<BOT_ID>.session-journal` nếu có.
+3. Giữ nguyên `state/orders.sqlite3`, thư mục `data/` và
+   `purchase_history.txt`, sau đó bấm **Start**.
+
+Session MTProto sẽ được tạo lại bằng bot token; dữ liệu đơn đã lưu không bị
+xóa. Không xóa toàn bộ thư mục `state/` vì trong đó có cơ sở dữ liệu
+chống trùng `order_id`.
 
 ## Giới hạn cần biết
 
@@ -144,4 +171,3 @@ file session sang nơi không tin cậy vì file đó có quyền truy cập tà
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
-"# src_read_bot_tele" 

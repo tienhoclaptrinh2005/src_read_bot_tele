@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import unittest
 
-from main import CompactConsoleFormatter, FileDetailFormatter
+from main import CompactConsoleFormatter, ConsoleNoiseFilter, FileDetailFormatter
 
 
 class LoggingFormatterTests(unittest.TestCase):
@@ -36,6 +36,21 @@ class LoggingFormatterTests(unittest.TestCase):
         self.assertIn("order saved | order=ORDER123", file_text)
         self.assertIn("product_file=/home/container/data/Canva Pro.txt", file_text)
         self.assertNotIn("product_file=", console)
+
+    def test_telethon_transport_noise_is_hidden_only_from_console(self) -> None:
+        noise_filter = ConsoleNoiseFilter()
+        telethon_record = logging.LogRecord(
+            name="telethon.network.mtprotosender",
+            level=logging.WARNING,
+            pathname=__file__,
+            lineno=1,
+            msg="Server sent a very old message",
+            args=(),
+            exc_info=None,
+        )
+
+        self.assertFalse(noise_filter.filter(telethon_record))
+        self.assertTrue(noise_filter.filter(self.record()))
 
 
 if __name__ == "__main__":

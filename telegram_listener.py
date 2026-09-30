@@ -10,15 +10,45 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from order_parser import OrderParseError, OrderParser
+from order_parser import (
+    DeliveryEnvelope,
+    IncompleteAccountBatch,
+    OrderParseError,
+    OrderParser,
+    PurchaseConfirmation,
+    SuccessfulOrder,
+)
 from storage import DuplicateOrderConflict, PurchaseStorage
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _ConfirmationContext:
+    product_key: str
+    product: str
+    quantity: int
+    observed_at: datetime
+    message_id: int | None
+
+
+@dataclass(slots=True)
+class _PendingDelivery:
+    combined_text: str
+    envelope: DeliveryEnvelope
+    expected_quantity: int | None
+    confirmation: _ConfirmationContext | None
+    purchased_at: datetime
+    username: str
+    header_message_id: int | None
+    last_message_id: int | None
+    chunk_count: int = 0
 
 
 def _shorten(value: object, limit: int = 64) -> str:
@@ -82,6 +112,8 @@ class TelegramOrderListener:
         self.stop_event = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client: Any | None = None
+        self._confirmations: dict[int, list[_ConfirmationContext]] = {}
+        self._pending_deliveries: dict[int, _PendingDelivery] = {}
 
     def stop(self) -> None:
         """Request a graceful disconnect without sending any Telegram message."""
@@ -111,8 +143,13 @@ class TelegramOrderListener:
                 self.api_id,
                 self.api_hash,
                 sequential_updates=True,
-                catch_up=True,
+                # We only need live orders. Replaying a large MTProto backlog
+                # causes stale-update/session warnings when the same bot also
+                # runs through an HTTP webhook.
+                catch_up=False,
                 auto_reconnect=True,
+                connection_retries=-1,
+                retry_delay=5,
             )
             self._client = client
 
@@ -242,6 +279,96 @@ class TelegramOrderListener:
         if purchased_at.tzinfo is None:
             purchased_at = purchased_at.replace(tzinfo=timezone.utc)
 
+        confirmation = self.parser.parse_confirmation(text)
+        if confirmation is not None and numeric_chat_id is not None:
+            self._remember_confirmation(
+                numeric_chat_id,
+                confirmation,
+                purchased_at,
+                message_id,
+            )
+            return
+
+        envelope = self.parser.parse_delivery_envelope(text)
+        if envelope is not None:
+            context = self._find_confirmation(
+                numeric_chat_id,
+                envelope.product,
+                purchased_at,
+            )
+            expected_quantity = context.quantity if context else None
+            try:
+                order = self.parser.build_delivery_order(
+                    envelope,
+                    default_user_id=numeric_chat_id or "",
+                    default_username=username,
+                    purchased_at=purchased_at,
+                    source_update_id=message_id,
+                    expected_quantity=expected_quantity,
+                )
+            except IncompleteAccountBatch as exc:
+                if numeric_chat_id is None:
+                    self._log_parse_error(exc, message_id, numeric_chat_id)
+                    return
+                self._pending_deliveries[numeric_chat_id] = _PendingDelivery(
+                    combined_text=text,
+                    envelope=envelope,
+                    expected_quantity=expected_quantity,
+                    confirmation=context,
+                    purchased_at=purchased_at,
+                    username=str(username),
+                    header_message_id=message_id,
+                    last_message_id=message_id,
+                )
+                self._log_waiting(envelope, exc.found, expected_quantity)
+                return
+            except OrderParseError as exc:
+                # A body with no credential-like data (empty or only a footer
+                # such as "Ngày trả đơn") means Telegram split the delivery.
+                # Buffer the next outgoing message instead of reporting SKIP.
+                if (
+                    numeric_chat_id is not None
+                    and not self._looks_like_account_chunk(envelope.account_text)
+                ):
+                    self._pending_deliveries[numeric_chat_id] = _PendingDelivery(
+                        combined_text=text,
+                        envelope=envelope,
+                        expected_quantity=expected_quantity,
+                        confirmation=context,
+                        purchased_at=purchased_at,
+                        username=str(username),
+                        header_message_id=message_id,
+                        last_message_id=message_id,
+                    )
+                    self._log_waiting(envelope, 0, expected_quantity)
+                    return
+                self._log_parse_error(exc, message_id, numeric_chat_id)
+                return
+
+            self._record_order(
+                order,
+                numeric_chat_id=numeric_chat_id,
+                username=username,
+                message_id=message_id,
+            )
+            self._consume_confirmation(numeric_chat_id, context)
+            return
+
+        pending = (
+            self._pending_deliveries.get(numeric_chat_id)
+            if numeric_chat_id is not None
+            else None
+        )
+        if pending is not None and self._looks_like_account_chunk(text):
+            self._continue_pending_delivery(
+                numeric_chat_id,
+                pending,
+                text=text,
+                message_id=message_id,
+                message_date=purchased_at,
+            )
+            return
+
         try:
             order = self.parser.parse(
                 text,
@@ -251,18 +378,201 @@ class TelegramOrderListener:
                 source_update_id=message_id,
             )
         except OrderParseError as exc:
-            _log_event(
-                logging.ERROR,
-                f"⚠️ [SKIP ] msg={message_id} · {_shorten(exc, 78)}",
-                file_detail=(
-                    f"order-like message skipped | message_id={message_id} | "
-                    f"chat_id={numeric_chat_id} | reason={exc}"
-                ),
-            )
+            self._log_parse_error(exc, message_id, numeric_chat_id)
             return
 
         if order is None:
             return
+
+        self._record_order(
+            order,
+            numeric_chat_id=numeric_chat_id,
+            username=username,
+            message_id=message_id,
+        )
+
+    def _remember_confirmation(
+        self,
+        chat_id: int,
+        confirmation: PurchaseConfirmation,
+        observed_at: datetime,
+        message_id: int | None,
+    ) -> None:
+        contexts = self._confirmations.setdefault(chat_id, [])
+        cutoff = observed_at - timedelta(hours=48)
+        contexts[:] = [item for item in contexts if item.observed_at >= cutoff]
+        contexts.append(
+            _ConfirmationContext(
+                product_key=self.parser.product_key(confirmation.product),
+                product=confirmation.product,
+                quantity=confirmation.quantity,
+                observed_at=observed_at,
+                message_id=message_id,
+            )
+        )
+        del contexts[:-20]
+        LOGGER.debug(
+            "confirmation tracked | chat_id=%s | product=%s | quantity=%s | message_id=%s",
+            chat_id,
+            confirmation.product,
+            confirmation.quantity,
+            message_id,
+        )
+
+    def _find_confirmation(
+        self,
+        chat_id: int | None,
+        product: str,
+        delivery_at: datetime,
+    ) -> _ConfirmationContext | None:
+        if chat_id is None:
+            return None
+        product_key = self.parser.product_key(product)
+        candidates = self._confirmations.get(chat_id, [])
+        for context in reversed(candidates):
+            age = delivery_at - context.observed_at
+            if (
+                context.product_key == product_key
+                and timedelta(minutes=-5) <= age <= timedelta(hours=48)
+            ):
+                return context
+        return None
+
+    def _consume_confirmation(
+        self,
+        chat_id: int | None,
+        context: _ConfirmationContext | None,
+    ) -> None:
+        if chat_id is None or context is None:
+            return
+        contexts = self._confirmations.get(chat_id)
+        if contexts and context in contexts:
+            contexts.remove(context)
+        if not contexts:
+            self._confirmations.pop(chat_id, None)
+
+    @staticmethod
+    def _looks_like_account_chunk(text: str) -> bool:
+        lowered = text.casefold()
+        return (
+            "|" in text
+            or "@" in text
+            or "http://" in lowered
+            or "https://" in lowered
+            or len(text.strip()) >= 80
+        )
+
+    def _continue_pending_delivery(
+        self,
+        chat_id: int,
+        pending: _PendingDelivery,
+        *,
+        text: str,
+        message_id: int | None,
+        message_date: datetime,
+    ) -> None:
+        if message_date - pending.purchased_at > timedelta(hours=1):
+            self._pending_deliveries.pop(chat_id, None)
+            _log_event(
+                logging.ERROR,
+                f"⚠️ [SKIP ] {pending.envelope.order_id} · dữ liệu giao hàng đã quá hạn",
+                file_detail=(
+                    f"split delivery expired | order={pending.envelope.order_id} | "
+                    f"chat_id={chat_id} | header_message_id={pending.header_message_id}"
+                ),
+            )
+            return
+
+        pending.combined_text = f"{pending.combined_text}\n{text}"
+        pending.last_message_id = message_id
+        pending.chunk_count += 1
+        if len(pending.combined_text) > 250_000 or pending.chunk_count > 20:
+            self._pending_deliveries.pop(chat_id, None)
+            _log_event(
+                logging.ERROR,
+                f"⚠️ [SKIP ] {pending.envelope.order_id} · dữ liệu giao hàng quá lớn",
+                file_detail=(
+                    f"split delivery exceeded limits | order={pending.envelope.order_id} | "
+                    f"chat_id={chat_id} | chars={len(pending.combined_text)} | "
+                    f"chunks={pending.chunk_count}"
+                ),
+            )
+            return
+
+        envelope = self.parser.parse_delivery_envelope(pending.combined_text)
+        if envelope is None:
+            self._pending_deliveries.pop(chat_id, None)
+            self._log_parse_error(
+                OrderParseError("Không ghép lại được thông báo giao hàng"),
+                message_id,
+                chat_id,
+            )
+            return
+        try:
+            order = self.parser.build_delivery_order(
+                envelope,
+                default_user_id=chat_id,
+                default_username=pending.username,
+                purchased_at=pending.purchased_at,
+                source_update_id=pending.header_message_id,
+                expected_quantity=pending.expected_quantity,
+            )
+        except IncompleteAccountBatch as exc:
+            self._log_waiting(envelope, exc.found, pending.expected_quantity)
+            return
+        except OrderParseError as exc:
+            self._pending_deliveries.pop(chat_id, None)
+            self._log_parse_error(exc, message_id, chat_id)
+            return
+
+        self._pending_deliveries.pop(chat_id, None)
+        self._record_order(
+            order,
+            numeric_chat_id=chat_id,
+            username=pending.username,
+            message_id=message_id,
+        )
+        self._consume_confirmation(chat_id, pending.confirmation)
+
+    @staticmethod
+    def _log_waiting(
+        envelope: DeliveryEnvelope,
+        found: int,
+        expected: int | None,
+    ) -> None:
+        total = str(expected) if expected is not None else "?"
+        _log_event(
+            logging.INFO,
+            f"⏳ [WAIT ] {envelope.order_id} · {found}/{total} tài khoản",
+            file_detail=(
+                f"split delivery waiting | order={envelope.order_id} | "
+                f"product={envelope.product} | found={found} | expected={total}"
+            ),
+        )
+
+    @staticmethod
+    def _log_parse_error(
+        exc: Exception,
+        message_id: int | None,
+        chat_id: int | None,
+    ) -> None:
+        _log_event(
+            logging.ERROR,
+            f"⚠️ [SKIP ] msg={message_id} · {_shorten(exc, 78)}",
+            file_detail=(
+                f"order-like message skipped | message_id={message_id} | "
+                f"chat_id={chat_id} | reason={exc}"
+            ),
+        )
+
+    def _record_order(
+        self,
+        order: SuccessfulOrder,
+        *,
+        numeric_chat_id: int | None,
+        username: object,
+        message_id: int | None,
+    ) -> None:
 
         try:
             result = self.storage.record_purchase(order)
